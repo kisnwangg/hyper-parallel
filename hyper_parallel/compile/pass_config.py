@@ -25,10 +25,16 @@ mode. The explicit field fixes that. Pipeline-parallel (``pp_enabled``)
 follows the same contract: intent here, runtime guard in ``PpPass``.
 """
 
-__all__ = ["PassConfig"]
+__all__ = ["PassConfig", "PP_SCHEDULES"]
 
 from dataclasses import dataclass
 from typing import Optional
+
+
+# Pipeline schedule names accepted by ``pp_schedule``. Kept torch-free here so
+# the config dataclass stays importable anywhere; ``pp_schedule``'s registry
+# (which does import torch) must expose exactly these keys.
+PP_SCHEDULES = ("gpipe", "1f1b")
 
 
 @dataclass
@@ -71,12 +77,19 @@ class PassConfig:
             path); for a PP+FSDP hybrid the FSDP group is a proper
             sub-group of the world and the trainer back-fills this from
             the mesh, exactly like ``fsdp_degree``.
-        pp_microbatch_size: Number of samples per microbatch for the GPipe
-            schedule. The per-step batch size (the leading dim of the
-            trainer's input tensor) must be divisible by this. ``1`` means
+        pp_microbatch_size: Number of samples per microbatch for the
+            pipeline schedule. The per-step batch size (the leading dim of
+            the trainer's input tensor) must be divisible by this. ``1`` means
             one sample per microbatch (maximum pipeline concurrency, most
             P2P traffic); larger values trade bubble size for fewer P2P
             round-trips.
+        pp_schedule: Pipeline schedule name, one of ``PP_SCHEDULES``.
+            ``"gpipe"`` (default) runs all forwards before all backwards
+            (simplest ordering, largest bubble). ``"1f1b"`` interleaves one
+            backward per forward in steady state, shrinking the pipeline
+            bubble; it requires ``num_microbatches >= pp_degree``.
+            ``PpPass`` resolves the name to a schedule class via
+            ``pp_schedule.get_schedule_class``.
 
     Note:
         ``fsdp_enabled`` / ``pp_enabled`` no longer probe
@@ -94,6 +107,7 @@ class PassConfig:
     pp_enabled: bool = False
     pp_degree: Optional[int] = None
     pp_microbatch_size: int = 1
+    pp_schedule: str = "gpipe"
 
     def __post_init__(self) -> None:
         self.validate()
@@ -103,8 +117,8 @@ class PassConfig:
 
         Raises:
             ValueError: On a negative ``tp_size``, a non-positive explicit
-                ``fsdp_degree`` / ``pp_degree``, or a non-positive
-                ``pp_microbatch_size``.
+                ``fsdp_degree`` / ``pp_degree``, a non-positive
+                ``pp_microbatch_size``, or an unknown ``pp_schedule``.
         """
         if self.tp_size < 1:
             raise ValueError(f"tp_size must be >= 1, got {self.tp_size}")
@@ -119,4 +133,10 @@ class PassConfig:
         if self.pp_microbatch_size < 1:
             raise ValueError(
                 f"pp_microbatch_size must be >= 1, got {self.pp_microbatch_size}"
+            )
+        if not isinstance(self.pp_schedule, str) or (
+            self.pp_schedule.lower() not in PP_SCHEDULES
+        ):
+            raise ValueError(
+                f"pp_schedule must be one of {PP_SCHEDULES}, got {self.pp_schedule!r}"
             )

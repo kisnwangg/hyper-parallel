@@ -44,6 +44,14 @@ Schedule driver (mocked subgraphs + mocked dist):
 9. ``ScheduleGPipe.forward`` microbatch loop: grad averaging, async send
    bookkeeping, receive buffers sized from recv_spec.
 
+1F1B schedule:
+14. ``Schedule1F1B`` warmup/steady/cooldown action order per stage and its
+    ``num_microbatches >= pp_degree`` guard.
+15. ``PpPass`` dispatches ``PassConfig.pp_schedule`` to the right schedule
+    class; the registry stays consistent with ``PP_SCHEDULES``.
+16. ``Schedule1F1B`` grads equal the non-PP full-batch mean gradient when
+    two stage schedules run concurrently against a thread-safe P2P shim.
+
 Review follow-ups:
 10. Skip-stage dataflow (values crossing 2+ cuts) is rejected up front
     with an actionable message instead of a generic slice-copy failure.
@@ -57,7 +65,8 @@ Review follow-ups:
 """
 
 import logging
-import os
+import queue
+import threading
 import unittest
 import warnings
 from contextlib import contextmanager
@@ -69,13 +78,16 @@ import torch
 from torch import fx, nn
 
 
-from hyper_parallel.compile.pass_config import PassConfig  # pylint: disable=C0413
+from hyper_parallel.compile.pass_config import PP_SCHEDULES, PassConfig  # pylint: disable=C0413
 from hyper_parallel.compile.passes.parallel.pp_pass import (  # pylint: disable=C0413
     PpPass,
     _auto_stage_split,
 )
 from hyper_parallel.compile.passes.parallel.pp_schedule import (  # pylint: disable=C0413
+    SCHEDULE_REGISTRY,
+    Schedule1F1B,
     ScheduleGPipe,
+    get_schedule_class,
 )
 from hyper_parallel.compile.graph_parallel_plan import GraphParallelPlan  # pylint: disable=C0413
 from hyper_parallel.compile.tracer.graph_tracer import (  # pylint: disable=C0413
@@ -857,6 +869,30 @@ def _tiny_gated_joint_graph(batch: int = 4):
     return jg, model, x, aux, y
 
 
+def _tiny_lm_stage_model() -> nn.Module:
+    """A fresh model matching ``_tiny_lm_joint_graph``'s module layout."""
+    torch.manual_seed(0)
+
+    class _LM(nn.Module):
+        """Same layout/init as ``_tiny_lm_joint_graph``'s _TracedTinyLM."""
+
+        def __init__(self) -> None:
+            """Initialize embed/lin0/lin1/head."""
+            super().__init__()
+            self.embed = nn.Embedding(16, 8)
+            self.lin0 = nn.Linear(8, 8)
+            self.lin1 = nn.Linear(8, 8)
+            self.head = nn.Linear(8, 16)
+
+    return _LM().to(torch.float64)
+
+
+def _tiny_gated_stage_model() -> nn.Module:
+    """A fresh model matching ``_tiny_gated_joint_graph``'s layout."""
+    torch.manual_seed(0)
+    return TinyGatedLM().to(torch.float64)
+
+
 class TestScheduleGradEquivalence(unittest.TestCase):
     """PP grads equal the non-PP full-batch mean-loss gradient.
 
@@ -871,20 +907,7 @@ class TestScheduleGradEquivalence(unittest.TestCase):
 
     def _stage_model(self):
         """A fresh model matching ``_tiny_lm_joint_graph``'s module layout."""
-        torch.manual_seed(0)
-
-        class _LM(nn.Module):
-            """Same layout/init as ``_tiny_lm_joint_graph``'s _TracedTinyLM."""
-
-            def __init__(self) -> None:
-                """Initialize embed/lin0/lin1/head."""
-                super().__init__()
-                self.embed = nn.Embedding(16, 8)
-                self.lin0 = nn.Linear(8, 8)
-                self.lin1 = nn.Linear(8, 8)
-                self.head = nn.Linear(8, 16)
-
-        return _LM().to(torch.float64)
+        return _tiny_lm_stage_model()
 
     def test_pp_grads_match_full_batch_mean(self):
         """Test 2-stage PP grads match the reference full-batch grads."""
@@ -952,8 +975,7 @@ class TestScheduleGradEquivalence(unittest.TestCase):
 
     def _gated_stage_model(self):
         """A fresh model matching ``_tiny_gated_joint_graph``'s layout."""
-        torch.manual_seed(0)
-        return TinyGatedLM().to(torch.float64)
+        return _tiny_gated_stage_model()
 
     def test_pp_grads_match_full_batch_mean_multi_input(self):
         """Test 3-input routing (two -> stage 0, one -> last) keeps grads.
@@ -1306,6 +1328,290 @@ class TestScheduleGPipe(unittest.TestCase):
             with self.assertRaises(ValueError) as ctx:
                 sched(torch.zeros(4, 4), torch.zeros(3, 7), torch.zeros(3, 7))
         self.assertIn("microbatch", str(ctx.exception))
+
+
+class TestSchedule1F1B(unittest.TestCase):
+    """1F1B warmup / steady / cooldown action order and guards."""
+
+    @staticmethod
+    def _make_sched(stage_idx, pp_degree, events, microbatch_size=2):
+        """Build a 1F1B schedule whose subgraphs record F/B action order."""
+        fwd_ret = (torch.ones(4, 4), torch.zeros(4))
+        bwd_ret = (torch.ones(4), torch.ones(4), torch.ones(4, 4))
+
+        def _fwd(*_args, **_kwargs):
+            events.append("F")
+            return fwd_ret
+
+        def _bwd(*_args, **_kwargs):
+            events.append("B")
+            return bwd_ret
+
+        return Schedule1F1B(
+            fwd_gm=MagicMock(side_effect=_fwd),
+            bwd_gm=MagicMock(side_effect=_bwd),
+            stage_idx=stage_idx,
+            pp_degree=pp_degree,
+            num_state=1,
+            num_trainable=2,
+            num_send=0 if stage_idx == pp_degree - 1 else 1,
+            grad_send_count=0 if stage_idx == 0 else 1,
+            microbatch_size=microbatch_size,
+            pp_group=MagicMock(),
+            recv_spec=(
+                [("tensor", (4, 4), torch.float32, torch.device("cpu"))]
+                if stage_idx > 0
+                else []
+            ),
+            grad_recv_spec=(
+                [("tensor", (4, 4), torch.float32, torch.device("cpu"))]
+                if stage_idx < pp_degree - 1
+                else []
+            ),
+            user_input_stages=(0, pp_degree - 1),
+        )
+
+    def test_first_stage_order(self):
+        """Stage 0: 3 warmup forwards, then 1B1F, then cooldown backwards."""
+        events = []
+        sched = self._make_sched(stage_idx=0, pp_degree=3, events=events)
+        state = [torch.zeros(4, 4)]
+        with patch(_SCHED_DIST_PATH) as mock_dist:
+            mock_dist.isend.return_value = MagicMock()
+            mock_dist.irecv.return_value = MagicMock()
+            mock_dist.get_global_rank.side_effect = lambda _g, r: r
+            sched(*state, torch.zeros(8, 8), torch.zeros(8, 8))
+        self.assertEqual(
+            events,
+            ["F", "F", "F", "B", "F", "B", "B", "B"],
+            f"stage 0 1F1B order mismatch: {events}",
+        )
+
+    def test_last_stage_order(self):
+        """Last stage: 1 warmup forward, then alternating B/F."""
+        events = []
+        sched = self._make_sched(stage_idx=2, pp_degree=3, events=events)
+        state = [torch.zeros(4, 4)]
+        with patch(_SCHED_DIST_PATH) as mock_dist:
+            mock_dist.isend.return_value = MagicMock()
+            mock_dist.irecv.return_value = MagicMock()
+            mock_dist.get_global_rank.side_effect = lambda _g, r: r
+            loss, *grads = sched(*state, torch.zeros(8, 8), torch.zeros(8, 8))
+        self.assertEqual(
+            events,
+            ["F", "B", "F", "B", "F", "B", "F", "B"],
+            f"last stage 1F1B order mismatch: {events}",
+        )
+        self.assertTrue(torch.is_tensor(loss))
+        self.assertEqual(len(grads), 2)
+
+    def test_middle_stage_grads_averaged_and_p2p_issued(self):
+        """Middle stage: fwd/bwd per microbatch, grads mean over microbatches."""
+        events = []
+        sched = self._make_sched(stage_idx=1, pp_degree=3, events=events)
+        state = [torch.zeros(4, 4)]
+        with patch(_SCHED_DIST_PATH) as mock_dist:
+            mock_dist.isend.return_value = MagicMock()
+            mock_dist.irecv.return_value = MagicMock()
+            mock_dist.get_global_rank.side_effect = lambda _g, r: r
+            loss, *grads = sched(*state, torch.zeros(6, 8), torch.zeros(6, 8))
+        # pp_degree=3, batch 6 / mb 2 -> 3 microbatches; warmup = 2, then
+        # steady (B0, F2) and cooldown (B1, B2).
+        self.assertEqual(
+            events, ["F", "F", "B", "F", "B", "B"], f"order mismatch: {events}"
+        )
+        self.assertEqual(sched.fwd_gm.call_count, 3)
+        self.assertEqual(sched.bwd_gm.call_count, 3)
+        # 3 grads of ones accumulated then averaged -> ones.
+        self.assertTrue(torch.allclose(grads[0], torch.ones(4)))
+        self.assertTrue(torch.allclose(grads[1], torch.ones(4)))
+        self.assertTrue(torch.allclose(loss, torch.zeros(())))
+        # sends: act_out + boundary grad per microbatch; recvs: act_in + grad_in.
+        self.assertEqual(mock_dist.isend.call_count, 6)
+        self.assertEqual(mock_dist.irecv.call_count, 6)
+
+    def test_requires_enough_microbatches(self):
+        """Test num_microbatches < pp_degree fails with an actionable error."""
+        events = []
+        sched = self._make_sched(stage_idx=0, pp_degree=3, events=events)
+        state = [torch.zeros(4, 4)]
+        with patch(_SCHED_DIST_PATH) as mock_dist:
+            mock_dist.isend.return_value = MagicMock()
+            mock_dist.irecv.return_value = MagicMock()
+            mock_dist.get_global_rank.side_effect = lambda _g, r: r
+            with self.assertRaises(ValueError) as ctx:
+                sched(*state, torch.zeros(4, 8), torch.zeros(4, 8))
+        self.assertIn("1F1B requires", str(ctx.exception))
+
+
+class TestScheduleRegistry(unittest.TestCase):
+    """Registry / PassConfig name consistency and lookup."""
+
+    def test_registry_matches_pass_config_names(self):
+        """Test the schedule registry exposes exactly ``PP_SCHEDULES``."""
+        self.assertEqual(
+            set(SCHEDULE_REGISTRY),
+            set(PP_SCHEDULES),
+            "pp_schedule registry and PassConfig.PP_SCHEDULES drifted",
+        )
+
+    def test_lookup_is_case_insensitive(self):
+        """Test names resolve case-insensitively."""
+        self.assertIs(get_schedule_class("1F1B"), Schedule1F1B)
+        self.assertIs(get_schedule_class("GPipe"), ScheduleGPipe)
+
+    def test_unknown_schedule_rejected(self):
+        """Test an unknown schedule name raises ValueError."""
+        with self.assertRaises(ValueError) as ctx:
+            get_schedule_class("zbv")
+        self.assertIn("pp_schedule", str(ctx.exception))
+
+
+class TestPpPassScheduleSelection(unittest.TestCase):
+    """``PpPass`` installs the schedule named by ``PassConfig.pp_schedule``."""
+
+    def test_default_schedule_is_gpipe(self):
+        """Test the default config installs ``ScheduleGPipe``."""
+        gm = _mini_llm_joint_graph()
+        _run_pp(gm, MiniLLM(), rank=0)
+        self.assertIsInstance(gm.pp_schedule, ScheduleGPipe)
+
+    def test_1f1b_schedule_installed_when_configured(self):
+        """Test ``pp_schedule='1f1b'`` installs ``Schedule1F1B``."""
+        gm = _mini_llm_joint_graph()
+        cfg = PassConfig(
+            fsdp_enabled=False,
+            pp_enabled=True,
+            pp_degree=2,
+            pp_microbatch_size=1,
+            pp_schedule="1f1b",
+        )
+        _run_pp(gm, MiniLLM(), rank=0, cfg=cfg)
+        self.assertIsInstance(gm.pp_schedule, Schedule1F1B)
+
+
+@contextmanager
+def _patch_threaded_p2p() -> Iterator[Any]:
+    """Patch ``dist`` inside ``pp_schedule`` with a thread-safe queue shim.
+
+    Each stage runs in its own thread and identifies itself through a
+    thread-local rank; ``isend``/``irecv`` route through per-``(src, dst)``
+    FIFO queues, so two real stage schedules can be stepped concurrently
+    without a distributed backend. Yields the thread-local the driver must
+    set ``.rank`` on before invoking a stage.
+    """
+    tls = threading.local()
+    queues: dict = {}
+    lock = threading.Lock()
+
+    def _queue_for(key: tuple) -> "queue.Queue":
+        with lock:
+            return queues.setdefault(key, queue.Queue())
+
+    def isend(tensor: torch.Tensor, dst: int = 0, group: Any = None) -> MagicMock:
+        """Queue a detached copy of the value being sent."""
+        del group
+        _queue_for((tls.rank, dst)).put(tensor.detach().clone())
+        return MagicMock()
+
+    def irecv(buffer: torch.Tensor, src: int = 0, group: Any = None) -> MagicMock:
+        """Fill ``buffer`` from the queue the source stage filled."""
+        del group
+        item = _queue_for((src, tls.rank)).get(timeout=30)
+        if buffer.shape == ():
+            buffer.fill_(item.reshape(()).to(torch.int64))
+        else:
+            buffer.copy_(item)
+        return MagicMock()
+
+    mock_dist = MagicMock()
+    mock_dist.isend.side_effect = isend
+    mock_dist.irecv.side_effect = irecv
+    mock_dist.get_global_rank.side_effect = lambda _g, r: r
+    with patch(_SCHED_DIST_PATH, mock_dist):
+        yield tls
+
+
+class TestSchedule1F1BGradEquivalence(unittest.TestCase):
+    """1F1B grads equal the non-PP full-batch mean-loss gradient.
+
+    Runs two stage schedules concurrently (one thread each) against a
+    thread-safe P2P shim, exercising the REAL warmup/steady/cooldown loop —
+    including its deadlock-freedom — instead of driving the private sweeps.
+    """
+
+    def test_pp_grads_match_full_batch_mean(self):
+        """Test 2-stage 1F1B grads match the reference full-batch grads."""
+        plan = GraphParallelPlan()
+        plan.pp_stage(0, ["embed", "lin0"])
+        plan.pp_stage(1, ["lin1", "head"])
+        cfg = PassConfig(
+            fsdp_enabled=False,
+            pp_enabled=True,
+            pp_degree=2,
+            pp_microbatch_size=2,
+            pp_schedule="1f1b",
+        )
+
+        # Reference: single-card full-batch gradient on the plain joint graph.
+        ref_jg, ref_model, x, y = _tiny_lm_joint_graph(batch=4)
+        _, ref_grads = run_traced_graph(ref_jg, ref_model, {"x": x, "y": y})
+        ref_fqns = [name for name, p in ref_model.named_parameters() if p.requires_grad]
+        ref_by_fqn = {n: g.clone() for n, g in zip(ref_fqns, ref_grads)}
+
+        # PP: one pruned model + 1F1B schedule per rank. Each stage is traced
+        # with a MICRO-batch sample and run on the full batch of 4 (the
+        # schedule slices it into 2 micro-batches of 2).
+        models, scheds = {}, {}
+        for rank in (0, 1):
+            jg, _, _, _ = _tiny_lm_joint_graph(batch=2)
+            model = _tiny_lm_stage_model()
+            with _patch_dist(world_size=2, rank=rank):
+                PpPass(parallel_plan=plan).run(jg.graph_module, cfg, model=model)
+            models[rank] = model
+            scheds[rank] = jg.graph_module.pp_schedule
+            self.assertIsInstance(scheds[rank], Schedule1F1B)
+
+        states = {r: [p.detach() for p in models[r].parameters()] for r in (0, 1)}
+        results: dict = {}
+        errors: dict = {}
+
+        def run_stage(rank: int) -> None:
+            """Run one stage's full 1F1B step under its thread-local rank."""
+            tls.rank = rank
+            try:
+                results[rank] = scheds[rank](*states[rank], x, y)
+            except Exception as exc:  # pylint: disable=broad-except
+                errors[rank] = exc
+
+        with _patch_threaded_p2p() as tls:
+            threads = [
+                threading.Thread(target=run_stage, args=(rank,)) for rank in (0, 1)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=60)
+            alive = [thread for thread in threads if thread.is_alive()]
+        self.assertFalse(alive, "1F1B schedule deadlocked across stages")
+        self.assertFalse(errors, f"stage raised: {errors}")
+
+        def _fqn_grads(rank: int, grads) -> dict:
+            """Map a stage's gradient list to FQNs via its model order."""
+            fqns = [
+                name for name, p in models[rank].named_parameters() if p.requires_grad
+            ]
+            return dict(zip(fqns, grads))
+
+        pp_by_fqn = {**_fqn_grads(0, results[0][1:]), **_fqn_grads(1, results[1][1:])}
+        self.assertEqual(
+            set(pp_by_fqn), set(ref_by_fqn), "PP must cover every trainable param"
+        )
+        for name, ref_g in ref_by_fqn.items():
+            self.assertTrue(
+                torch.allclose(pp_by_fqn[name], ref_g, atol=1e-6, rtol=1e-5),
+                f"1F1B grad for {name}={pp_by_fqn[name]} != reference {ref_g}",
+            )
 
 
 if __name__ == "__main__":

@@ -46,3 +46,4 @@ parallel:
   pp_enabled: true        # opt-in; PpPass slices the joint graph per stage
   pp_degree: 2            # == world_size (one stage per rank, v1)
   pp_microbatch_size: 2   # batch_size 8 -> 4 microbatches in flight
+  pp_schedule: gpipe      # "gpipe" | "1f1b" (1f1b needs microbatches >= pp_degree)

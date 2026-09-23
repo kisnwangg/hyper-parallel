@@ -143,6 +143,7 @@ def build_pass_config(config: dict) -> PassConfig:
         pp_enabled=parallel.get("pp_enabled", True),
         pp_degree=parallel.get("pp_degree"),
         pp_microbatch_size=parallel.get("pp_microbatch_size", 1),
+        pp_schedule=parallel.get("pp_schedule", "gpipe"),
     )
 
 
@@ -180,8 +181,9 @@ def main() -> None:  # pylint: disable=too-many-locals
         stages = parallel_plan.pp_module_fqns_per_stage or "auto (even by layers)"
         _LOG.info("=" * 72)
         _LOG.info(
-            "PP demo: world_size=%s (stages), microbatch=%s",
+            "PP demo: world_size=%s (stages), schedule=%s, microbatch=%s",
             world_size,
+            pass_config.pp_schedule,
             pass_config.pp_microbatch_size,
         )
         _LOG.info("Stage plan: %s", stages)

@@ -30,7 +30,7 @@ joint graph (fwd+bwd, params as static placeholders)
 per-rank stage slices: fwd_gm + bwd_gm  ── boundary act/grad via isend/irecv
         │
         ▼
-ScheduleGPipe installed as a call_module node in the graph stub
+ScheduleGPipe / Schedule1F1B installed as a call_module node in the graph stub
         │
         ▼
 GraphTrainer runs graph_module(*state, *inputs) unchanged; user inputs are
@@ -48,10 +48,10 @@ routed by dataflow to the stage that consumes them (no arity constraint)
    forwards can run before all backwards (GPipe).
 4. **Live-model pruning** — foreign-stage submodules are removed in place,
    so `model.parameters()` / the optimizer only see this rank's stage.
-5. **Schedule install** — `ScheduleGPipe` (eager `dist.isend`/`irecv`,
-   microbatched, grads averaged over microbatches) is installed as a
-   `call_module` node, surviving recompiles; the trainer needs zero PP
-   awareness.
+5. **Schedule install** — `ScheduleGPipe` or `Schedule1F1B` (eager
+   `dist.isend`/`irecv`, microbatched, grads averaged over microbatches) is
+   installed as a `call_module` node, surviving recompiles; the trainer needs
+   zero PP awareness.
 
 ## Stage split options
 
@@ -82,6 +82,7 @@ Both come from `GraphParallelPlan.pp_stage(stage_idx, fqns)` /
 | `pp_enabled` | `false` | Opt in to the PP pass |
 | `pp_degree` | `null` | `null` → `world_size`; v1 requires `pp_degree == world_size` |
 | `pp_microbatch_size` | `1` | Samples per microbatch; batch must be divisible |
+| `pp_schedule` | `"gpipe"` | `"gpipe"` (all forwards then all backwards) or `"1f1b"` (steady-state one backward per forward; needs microbatches ≥ `pp_degree`) |
 | `enable_overlap` | `true` | No-op under PP (the schedule overlaps at Python level) |
 
 ## Current constraints (v1)
@@ -96,7 +97,10 @@ Both come from `GraphParallelPlan.pp_stage(stage_idx, fqns)` /
 - **Multi-value stage cuts**: every value crossing a cut ships over P2P
   (tensors as-is, int scalars packed as 0-d int64). Gradients flow back
   during the backward sweep.
-- **GPipe schedule**: forward sweep then backward sweep. 1F1B / ZB-V land
-  in `passes/parallel/pp_schedule.py` as additional schedule classes.
+- **Schedule choice**: `pp_schedule: gpipe` (default) runs all forwards
+  before all backwards; `pp_schedule: 1f1b` interleaves one backward per
+  forward in steady state, shrinking the pipeline bubble at the cost of a
+  `num_microbatches >= pp_degree` requirement. Interleaved / ZB-V schedules
+  land in `passes/parallel/pp_schedule.py` as additional classes.
 - Loss is only real on the last stage; other stages return a zero scalar
   (see `Last-stage loss:` in the run output for convergence).

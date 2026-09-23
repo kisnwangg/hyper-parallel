@@ -40,8 +40,9 @@ chunk in a ``PipelineStage``), this pass:
 4. Prunes foreign-stage submodules from the live model (torch's
    ``named_parameters`` then yields only this stage's entries, keeping the
    trainer / optimizer FSDP- and PP-agnostic).
-5. Installs a self-contained ``ScheduleGPipe`` (eager ``dist.isend`` /
-   ``irecv`` P2P) as a ``call_module`` node in a stub graph — the trainer's
+5. Installs a self-contained pipeline schedule (``ScheduleGPipe`` by
+   default; ``Schedule1F1B`` when ``PassConfig.pp_schedule == "1f1b"``) as a
+   ``call_module`` node in a stub graph — the trainer's
    ``graph_module(*flat_inputs)`` dispatches to it unchanged, and the stub
    survives any later ``recompile()`` because the schedule lives in the
    graph itself, not in an overwritten ``forward``.
@@ -67,7 +68,7 @@ from torch import fx, nn
 from ...pass_config import PassConfig
 from ..base import GraphPass
 from ...graph_parallel_plan import GraphParallelPlan
-from .pp_schedule import ScheduleGPipe
+from .pp_schedule import PipelineScheduleBase, get_schedule_class
 
 _LOG = logging.getLogger(__name__)
 
@@ -307,7 +308,9 @@ class PpPass(GraphPass):
 
         Returns:
             The same graph module, rewritten into a stage stub whose
-            ``call_module`` node invokes the installed ``ScheduleGPipe``.
+            ``call_module`` node invokes the installed pipeline schedule
+            (``ScheduleGPipe`` / ``Schedule1F1B`` per
+            ``pass_config.pp_schedule``).
         """
         run_ctx = self._resolve_run_context(pass_config, kwargs)
         if run_ctx is None:
@@ -1729,8 +1732,8 @@ class PpPass(GraphPass):
         split: _StageSplit,
         num_trainable: int,
         boundaries: _Boundaries,
-    ) -> ScheduleGPipe:
-        """Assemble the ``ScheduleGPipe`` for this stage.
+    ) -> PipelineScheduleBase:
+        """Assemble this stage's pipeline schedule (``pass_config.pp_schedule``).
 
         Receive descriptors come from the boundary values' fake-tensor
         ``val`` metas; the send side packs by value type at runtime.
@@ -1745,7 +1748,8 @@ class PpPass(GraphPass):
             if run_ctx.stage_idx < run_ctx.pp_degree - 1
             else []
         )
-        return ScheduleGPipe(
+        schedule_cls = get_schedule_class(pass_config.pp_schedule)
+        return schedule_cls(
             fwd_gm,
             bwd_gm,
             stage_idx=run_ctx.stage_idx,
@@ -1764,7 +1768,7 @@ class PpPass(GraphPass):
     def _install_stub(
         self,
         graph_module: fx.GraphModule,
-        sched: ScheduleGPipe,
+        sched: PipelineScheduleBase,
         stage_state_fqns: List[str],
         state_is_param: Sequence[bool],
         stage_state_indices: List[int],
